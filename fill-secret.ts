@@ -508,11 +508,17 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
   const patterns = allowDomains.map(d => domainGlobToRegExp(d).source);
   const store = area === "local" ? "localStorage" : "sessionStorage";
   return `async page => {
-  const host = String(await page.evaluate(() => location.hostname)).toLowerCase();
   const allowed = ${JSON.stringify(patterns)};
-  if (!allowed.some(p => new RegExp(p, "i").test(host)))
-    throw new Error("read-storage refused: the page host " + JSON.stringify(host) + " is not allowed by --allow-domain");
-  const out = await page.evaluate(({ key, path }) => {
+  const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
+  const ok = (h) => h && allowed.some(p => new RegExp(p, "i").test(h));
+  // Over the extension bridge the main frame can be a blank wrapper (location is ""), while the
+  // real page is a child frame; snapshot sees it but page.evaluate(() => location) does not. Pick
+  // the frame whose URL host matches --allow-domain and read storage there. frame.url() is reliable.
+  const frame = page.frames().find(f => ok(hostOf(f.url())));
+  const host = frame ? hostOf(frame.url()) : hostOf(page.url());
+  if (!frame)
+    throw new Error("read-storage refused: no open frame on an --allow-domain host (nearest page host " + JSON.stringify(host) + ")");
+  const out = await frame.evaluate(({ key, path }) => {
     const raw = window.${store}.getItem(key);
     if (raw === null) return { missing: true };
     if (!path.length) return { value: raw };
