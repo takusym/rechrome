@@ -511,13 +511,18 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
   const allowed = ${JSON.stringify(patterns)};
   const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
   const ok = (h) => h && allowed.some(p => new RegExp(p, "i").test(h));
-  // Over the extension bridge the main frame can be a blank wrapper (location is ""), while the
-  // real page is a child frame; snapshot sees it but page.evaluate(() => location) does not. Pick
-  // the frame whose URL host matches --allow-domain and read storage there. frame.url() is reliable.
-  const frame = page.frames().find(f => ok(hostOf(f.url())));
-  const host = frame ? hostOf(frame.url()) : hostOf(page.url());
+  // Search EVERY tab (context.pages()), not just the active one: the allowed site may be in a
+  // background tab while the foreground is something else (an extension page with host ""). Also
+  // scan child frames. frame.url() is the reliable host source over the extension bridge.
+  const pages = page.context().pages();
+  let frame;
+  for (const pg of pages) {
+    frame = pg.frames().find(f => ok(hostOf(f.url())));
+    if (frame) break;
+  }
+  const host = frame ? hostOf(frame.url()) : "";
   if (!frame)
-    throw new Error("read-storage refused: no open frame on an --allow-domain host (nearest page host " + JSON.stringify(host) + ")");
+    throw new Error("read-storage refused: no open tab on an --allow-domain host (checked " + pages.length + " tab(s))");
   const out = await frame.evaluate(({ key, path }) => {
     const raw = window.${store}.getItem(key);
     if (raw === null) return { missing: true };
