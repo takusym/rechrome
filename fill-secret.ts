@@ -552,22 +552,9 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
 }
 
 export async function readStorageOnSession(opts: { socketRoot: string; session: string; cwd: string; area: "local" | "session"; key: string; path: string[]; allowDomains: string[] }): Promise<{ host: string; value: string }> {
-  // Over the extension bridge Playwright only reaches the FOREGROUND tab, and the allowed site may
-  // be in a background tab. Find it in the relay's tab list and foreground it before reading.
-  const hostOf = (u: string) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
-  const allow = opts.allowDomains.map(d => domainGlobToRegExp(d));
-  const ok = (h: string) => !!h && allow.some(r => r.test(h));
-  try {
-    const tabs = await runCliOnSession(opts, ["tab-list"]);
-    // Lines like: "- 2: (current) [title](https://host/...)". Pick the first allowed, non-current.
-    const rows = [...tabs.text.matchAll(/^- (\d+): (\(current\) )?\[[^\]]*\]\(([^)]+)\)/gm)]
-      .map(m => ({ idx: m[1]!, current: !!m[2], host: hostOf(m[3]!) }));
-    const target = rows.find(r => ok(r.host));
-    if (target && !target.current) {
-      await runCliOnSession(opts, ["tab-select", target.idx]).catch(() => {});
-      await new Promise(r => setTimeout(r, 1200)); // let the relay re-attach to the new foreground
-    }
-  } catch { /* fall through: read the current tab */ }
+  // Over the extension bridge Playwright reaches only the tab the relay is attached to, and
+  // localStorage is per-origin. The caller puts the allowed site on that tab first (rech goto
+  // <url>); here we just read it. Retry briefly in case the attach is still settling.
   let last = "";
   for (let attempt = 0; attempt < 3; attempt++) {
     const { isError, text } = await runCodeOnSession({ socketRoot: opts.socketRoot, session: opts.session, cwd: opts.cwd, code: buildReadStorageCode(opts.area, opts.key, opts.path, opts.allowDomains), json: true });
@@ -580,10 +567,12 @@ export async function readStorageOnSession(opts: { socketRoot: string; session: 
       throw new Error("read-storage: the page returned no value");
     }
     last = text.match(/read-storage(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-storage: could not read the value");
-    // "foreground tab is not on an allowed host" can be a transient attach lag: settle and retry.
     if (!/foreground tab is not on/.test(last)) break;
     await new Promise(r => setTimeout(r, 1000));
   }
+  // A clearer hint for the common case: the allowed site isn't the attached tab.
+  if (/foreground tab is not on/.test(last))
+    last += ". Put the site on the active tab first: rech goto <url on that host>, then rerun read-storage.";
   throw new Error(last || "read-storage: could not read the value");
 }
 
