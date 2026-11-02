@@ -340,6 +340,20 @@ export async function runCodeOnSession(opts: { socketRoot: string; session: stri
   throw new Error(`could not reach this session's browser (${errors.join("; ")}); run \`rech open <url>\` first`);
 }
 
+/** Run a plain CLI command (e.g. tab-list, tab-select) on the session's browser over its socket. */
+export async function runCliOnSession(opts: { socketRoot: string; session: string; cwd: string }, cliArgs: string[]): Promise<{ isError: boolean; text: string }> {
+  const candidates = [...new Set([...sessionSocketCandidates(opts.socketRoot, opts.session), ...daemonSessionSockets(opts.session)])];
+  for (const path of candidates) {
+    let reply: { result?: any; error?: string };
+    try { reply = await socketRequest(path, "run", { args: { _: cliArgs }, cwd: opts.cwd }); }
+    catch { continue; }
+    if (reply.error) throw new Error(reply.error);
+    const r = reply.result;
+    return { isError: !!r?.isError, text: typeof r === "string" ? r : typeof r?.text === "string" ? r.text : "" };
+  }
+  throw new Error("no browser is open in this session");
+}
+
 /**
  * Fill on the session's live browser. Returns the cliDaemon's reply (NOT yet masked — the
  * caller masks it) or throws an error whose message never contains the value.
@@ -511,18 +525,12 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
   const allowed = ${JSON.stringify(patterns)};
   const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
   const ok = (h) => h && allowed.some(p => new RegExp(p, "i").test(h));
-  // Search EVERY tab (context.pages()), not just the active one: the allowed site may be in a
-  // background tab while the foreground is something else (an extension page with host ""). Also
-  // scan child frames. frame.url() is the reliable host source over the extension bridge.
-  const pages = page.context().pages();
-  let frame;
-  for (const pg of pages) {
-    frame = pg.frames().find(f => ok(hostOf(f.url())));
-    if (frame) break;
-  }
+  // The caller has foregrounded the --allow-domain tab; read from whichever of this tab's frames
+  // is on the allowed host (the top frame can be a blank wrapper over the bridge).
+  const frame = page.frames().find(f => ok(hostOf(f.url())));
   const host = frame ? hostOf(frame.url()) : "";
   if (!frame)
-    throw new Error("read-storage refused: no open tab on an --allow-domain host (checked " + pages.length + " tab(s))");
+    throw new Error("read-storage refused: the foreground tab is not on an --allow-domain host (host " + JSON.stringify(hostOf(page.url())) + ")");
   const out = await frame.evaluate(({ key, path }) => {
     const raw = window.${store}.getItem(key);
     if (raw === null) return { missing: true };
@@ -544,14 +552,39 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
 }
 
 export async function readStorageOnSession(opts: { socketRoot: string; session: string; cwd: string; area: "local" | "session"; key: string; path: string[]; allowDomains: string[] }): Promise<{ host: string; value: string }> {
-  const { isError, text } = await runCodeOnSession({ ...opts, code: buildReadStorageCode(opts.area, opts.key, opts.path, opts.allowDomains), json: true });
-  if (isError) throw new Error(text.match(/read-storage(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-storage: could not read the value"));
-  let raw: unknown;
-  try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
-  let o: any = raw;
-  for (let i = 0; i < 2 && typeof o === "string"; i++) { try { o = JSON.parse(o); } catch { o = undefined; } }
-  if (!o || typeof o.host !== "string" || typeof o.value !== "string") throw new Error("read-storage: the page returned no value");
-  return o;
+  // Over the extension bridge Playwright only reaches the FOREGROUND tab, and the allowed site may
+  // be in a background tab. Find it in the relay's tab list and foreground it before reading.
+  const hostOf = (u: string) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
+  const allow = opts.allowDomains.map(d => domainGlobToRegExp(d));
+  const ok = (h: string) => !!h && allow.some(r => r.test(h));
+  try {
+    const tabs = await runCliOnSession(opts, ["tab-list"]);
+    // Lines like: "- 2: (current) [title](https://host/...)". Pick the first allowed, non-current.
+    const rows = [...tabs.text.matchAll(/^- (\d+): (\(current\) )?\[[^\]]*\]\(([^)]+)\)/gm)]
+      .map(m => ({ idx: m[1]!, current: !!m[2], host: hostOf(m[3]!) }));
+    const target = rows.find(r => ok(r.host));
+    if (target && !target.current) {
+      await runCliOnSession(opts, ["tab-select", target.idx]).catch(() => {});
+      await new Promise(r => setTimeout(r, 1200)); // let the relay re-attach to the new foreground
+    }
+  } catch { /* fall through: read the current tab */ }
+  let last = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { isError, text } = await runCodeOnSession({ socketRoot: opts.socketRoot, session: opts.session, cwd: opts.cwd, code: buildReadStorageCode(opts.area, opts.key, opts.path, opts.allowDomains), json: true });
+    if (!isError) {
+      let raw: unknown;
+      try { raw = JSON.parse(text).result; } catch { raw = text.match(/### Result\n([^\n]*)/)?.[1]; }
+      let o: any = raw;
+      for (let i = 0; i < 2 && typeof o === "string"; i++) { try { o = JSON.parse(o); } catch { o = undefined; } }
+      if (o && typeof o.host === "string" && typeof o.value === "string") return o;
+      throw new Error("read-storage: the page returned no value");
+    }
+    last = text.match(/read-storage(?: refused)?: [^\n]*/)?.[0] ?? (/no browser is open|could not reach/.test(text) ? text.trim().split("\n")[0]! : "read-storage: could not read the value");
+    // "foreground tab is not on an allowed host" can be a transient attach lag: settle and retry.
+    if (!/foreground tab is not on/.test(last)) break;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error(last || "read-storage: could not read the value");
 }
 
 // ---------- read-cookie: a cookie value (incl. HttpOnly) to a pipe ----------
