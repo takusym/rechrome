@@ -532,7 +532,7 @@ export function buildReadStorageCode(area: "local" | "session", key: string, pat
   const store = area === "local" ? "localStorage" : "sessionStorage";
   return `async page => {
   const allowed = ${JSON.stringify(patterns)};
-  const hostOf = (u) => { try { return new URL(u).hostname.toLowerCase(); } catch { return ""; } };
+  const hostOf = (u) => { const m = /^[a-z][a-z0-9+.-]*:\\/\\/([^/?#]+)/i.exec(String(u || "")); return m ? m[1].replace(/^[^@]*@/, "").replace(/:\\d+$/, "").toLowerCase() : ""; };
   const ok = (h) => h && allowed.some(p => new RegExp(p, "i").test(h));
   // The caller has foregrounded the --allow-domain tab; read from whichever of this tab's frames
   // is on the allowed host (the top frame can be a blank wrapper over the bridge).
